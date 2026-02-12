@@ -160,6 +160,9 @@ app.get("/api/game", async (req, res) => {
   }
 });
 
-app.listen(3000, () => {
+/* app.listen(3000, () => {
   console.log("Servidor rodando na porta 3000 localmente");
-});
+}); */
+
+// No final do server.js
+module.exports = app;  // ou export default app; se usar ESM
