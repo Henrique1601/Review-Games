@@ -1,0 +1,21 @@
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "3000:3000"
+    env_file:
+      - ./backend/.env
+    volumes:
+      - ./backend:/app
+      - /app/node_modules
+  frontend:
+    build: ./frontend
+    ports:
+      - "5173:5173" # porta correta do Vite dev server (não 4173!)
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - backend
+    environment: # opcional, força modo dev
+      - VITE_HOST=0.0.0.0
