@@ -1,168 +1,233 @@
 const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
-const nodemon = require("nodemon");
+const mongoose = require("mongoose");
 require("dotenv").config();
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-const moongose = require("mongoose");
-moongose
-  .connect(process.env.MONGO_URI)
-  .then(() => console.log("MongoDB conectado"))
-  .catch((err) => console.error("Erro ao conectar MongoDB:", err));
+// Conexão com MongoDB com fallback gracioso
+if (process.env.MONGO_URI) {
+  mongoose
+    .connect(process.env.MONGO_URI)
+    .then(() => console.log("MongoDB conectado com sucesso"))
+    .catch((err) => console.error("Aviso: Erro ao conectar MongoDB:", err.message));
+} else {
+  console.warn("Aviso: MONGO_URI não definida no ambiente.");
+}
 
-const GameLog = moongose.model("GameLog", {
-  name: String,
-  query: String,
-  timestamp: { type: Date, default: Date.now },
+// Model de Logs de Pesquisas
+const GameLog = mongoose.model(
+  "GameLog",
+  new mongoose.Schema({
+    name: { type: String, required: true },
+    query: { type: String, required: true },
+    timestamp: { type: Date, default: Date.now },
+  })
+);
+
+// Rota de Health Check
+app.get("/api/health", (req, res) => {
+  res.json({
+    status: "ok",
+    timestamp: new Date().toISOString(),
+    mongoConnected: mongoose.connection.readyState === 1,
+  });
 });
 
+// Rota Principal de Detalhes e Análise do Jogo
 app.get("/api/game", async (req, res) => {
   const query = req.query.query;
+
+  if (!query || typeof query !== "string" || !query.trim()) {
+    return res.status(400).json({ error: "Parâmetro 'query' é obrigatório e não pode ser vazio." });
+  }
+
+  const cleanQuery = query.trim();
+
   try {
-    // Busca o jogo na RAWG API
-    const searchRes = await axios.get(
-      `https://api.rawg.io/api/games?key=${process.env.RAWG_API_KEY}&search=${query}`,
-    );
-    if (!searchRes.data.results || searchRes.data.results.length === 0) {
-      return res.status(404).json({ error: "Jogo não encontrado" });
+    // 1. Busca inicial do jogo na RAWG API
+    const rawgApiKey = process.env.RAWG_API_KEY;
+    if (!rawgApiKey) {
+      return res.status(500).json({ error: "Chave RAWG_API_KEY não configurada no servidor." });
     }
+
+    const searchRes = await axios.get(
+      `https://api.rawg.io/api/games?key=${rawgApiKey}&search=${encodeURIComponent(cleanQuery)}&page_size=1`,
+      { timeout: 8000 }
+    );
+
+    if (!searchRes.data.results || searchRes.data.results.length === 0) {
+      return res.status(404).json({ error: `Nenhum jogo encontrado para a busca "${cleanQuery}".` });
+    }
+
     const gameId = searchRes.data.results[0].id;
+
+    // 2. Detalhes completos do jogo
     const detailsRes = await axios.get(
-      `https://api.rawg.io/api/games/${gameId}?key=${process.env.RAWG_API_KEY}`,
+      `https://api.rawg.io/api/games/${gameId}?key=${rawgApiKey}`,
+      { timeout: 8000 }
     );
     const game = detailsRes.data;
 
     if (!game) {
-      return res.status(404).json({ error: "Jogo não encontrado" });
+      return res.status(404).json({ error: "Detalhes do jogo não encontrados." });
     }
 
-    let MetaText 
-    let aiVerdict = "Sem análise de IA disponível";
-    let ratingDisplay = game.rating
-      ? `${game.rating.toFixed(1)} / 5 (${game.ratings_count || 0} avaliações)`
-      : "Sem nota ainda";
+    // Persistência ativa de log no MongoDB (Auditoria)
+    if (mongoose.connection.readyState === 1) {
+      GameLog.create({
+        name: game.name || cleanQuery,
+        query: cleanQuery,
+        timestamp: new Date(),
+      }).catch((logErr) => console.warn("Erro ao persistir log:", logErr.message));
+    }
 
-    // Reviews para IA
-    let reviews = "";
+    // 3. Formatação da Avaliação da Crítica e Comunidade
+    let metaText = "Sem pontuação Metacritic disponível";
+    if (game.metacritic) {
+      const meta = game.metacritic;
+      const evaluation =
+        meta >= 85
+          ? "Aclamação Universal ⭐⭐⭐⭐⭐"
+          : meta >= 75
+          ? "Geralmente Favorável 👍"
+          : meta >= 60
+          ? "Avaliações Médias 🤔"
+          : "Avaliações Negativas 👎";
+      metaText = `${evaluation} (Metacritic: ${meta}/100)`;
+    }
+
+    const ratingDisplay = game.rating
+      ? `${game.rating.toFixed(1)} / 5 (${game.ratings_count || 0} avaliações)`
+      : "Sem avaliações suficientes";
+
+    // 4. Análise de Sentimento com HuggingFace (com isolamento de falha)
+    let aiVerdict = "Poucas reviews textuais – confie na nota da crítica e comunidade.";
     try {
       const reviewRes = await axios.get(
-        `https://api.rawg.io/api/games/${game.id}/reviews?key=${process.env.RAWG_API_KEY}&page_size=20`,
-      ); // 20 já basta, 100 pode ser overkill e lento
-      reviews = reviewRes.data.results
+        `https://api.rawg.io/api/games/${gameId}/reviews?key=${rawgApiKey}&page_size=15`,
+        { timeout: 6000 }
+      );
+
+      const reviews = (reviewRes.data.results || [])
         .map((r) => r.text_clean || r.text || "")
-        .filter((text) => text.trim().length > 20) // filtra reviews muito curtas/inúteis
+        .filter((text) => text.trim().length > 25)
         .join(" . ");
 
-      console.log(
-        "Reviews encontradas:",
-        reviewRes.data.results.length,
-        " - Texto exemplo:",
-        reviews.substring(0, 200),
-      );
-    } catch (err) {
-      console.warn("Erro ao buscar reviews:", err.message);
-    }
-
-    if (reviews.trim().length > 100) {
-      // Só chama IA se tiver texto decente
-      try {
+      if (reviews.trim().length > 80 && process.env.HF_API_KEY) {
         const aiRes = await axios.post(
-          'https://router.huggingface.co/hf-inference/models/cardiffnlp/twitter-roberta-base-sentiment-latest',
+          "https://router.huggingface.co/hf-inference/models/cardiffnlp/twitter-roberta-base-sentiment-latest",
           { inputs: reviews.substring(0, 1500) },
           {
             headers: {
               Authorization: `Bearer ${process.env.HF_API_KEY}`,
               "Content-Type": "application/json",
             },
-            timeout: 30000, // evita travar muito
-          },
+            timeout: 10000,
+          }
         );
-      
-      console.log("Resposta da IA (raw):", JSON.stringify(aiRes.data));   
 
-      const output = aiRes.data[0]; //[0]
-      const top = output.reduce((a, b) => a.score > b.score ? a : b)
+        if (Array.isArray(aiRes.data) && Array.isArray(aiRes.data[0])) {
+          const scores = aiRes.data[0];
+          const top = scores.reduce((prev, current) => (prev.score > current.score ? prev : current));
 
-      let verdictText;
-      let emoji = ''
-      
-      if (top.label === 'LABEL_2' ) {
-      verdictText = `Sim, é bom! `;
-      emoji = '👍'
-    } else if (top.label === 'LABEL_0'){
-      verdictText= `Não, evite... `;
-      emoji = '👎'
-    } else { 
-      verdictText = `Misto, avalie por conta própria`;
-      emoji = '🤔'
+          let verdictLabel = "Misto / Divisivo";
+          let verdictEmoji = "🤔";
+
+          if (top.label === "LABEL_2" || top.label === "positive") {
+            verdictLabel = "Recomendado pela crítica dos jogadores";
+            verdictEmoji = "👍";
+          } else if (top.label === "LABEL_0" || top.label === "negative") {
+            verdictLabel = "Não recomendado / Recepção desfavorável";
+            verdictEmoji = "👎";
+          }
+
+          aiVerdict = `${verdictLabel} ${verdictEmoji} (Confiança IA: ${(top.score * 100).toFixed(0)}%)`;
+        }
+      }
+    } catch (aiErr) {
+      console.warn("Aviso IA (HuggingFace): fallback ativado -", aiErr.message);
+      if (game.metacritic >= 75) {
+        aiVerdict = `Forte recomendação pela crítica especializada (${game.metacritic}/100 Metacritic).`;
+      } else if (game.rating >= 4.0) {
+        aiVerdict = `Altamente elogiado pela comunidade (${game.rating.toFixed(1)}/5 na RAWG).`;
+      } else {
+        aiVerdict = "Análise de IA temporariamente indisponível. Baseie-se nos dados da crítica.";
+      }
     }
-    
-    aiVerdict = `${verdictText} ${emoji} (confianca: ${(top.score * 100).toFixed(0)}%)`;
-    
-    // Fallback forte com Metacritic se IA não for positiva ou clara
-    if (top.label !== 'LABEL_1' || top.score < 0.70 ) {
-    if (game.metacritic) {
-    const meta = game.metacritic;
-    let metaText = meta >= 85 ? 'Ótimo pela crítica! ⭐⭐⭐⭐⭐' 
-                  : meta >= 75 ? 'Muito bom 👍' 
-                  : meta >= 65 ? 'Bom, vale tentar' 
-                  : meta >= 50 ? 'Médio / divisivo 🤔' 
-                  : 'Ruim pela crítica 👎';
-    aiVerdict = `${aiVerdict}`;
-    MetaText = `${metaText} (Metacritic: ${meta}/100)`;
 
-  } else if (game.rating >= 4.0) {
-    aiVerdict = `Nota dos jogadores alta: ${ratingDisplay} – Recomendado pela comunidade!`;
-  }
-}
-    console.log('IA Verdict:', aiVerdict, ' - Raw output:', JSON.stringify(aiRes.data));
+    // 5. Trailers no YouTube (com isolamento de cota / Graceful Degradation)
+    let videos = [];
+    try {
+      if (process.env.YT_API_KEY) {
+        const ytRes = await axios.get(
+          `https://www.googleapis.com/youtube/v3/search?part=snippet&maxResults=6&q=${encodeURIComponent(
+            cleanQuery + " game trailer gameplay"
+          )}&key=${process.env.YT_API_KEY}&type=video`,
+          { timeout: 7000 }
+        );
 
-  } catch (aiErr) {
-    console.error('Erro na IA:', aiErr.message);
-    aiVerdict = 'Não foi possível analisar  (usando fallback)';
-  }
-} else {
-  aiVerdict = 'Poucas reviews textuais – confie na nota RAWG/Metacritic';
-}
+        videos = (ytRes.data.items || [])
+          .filter((item) => item.id && item.id.kind === "youtube#video")
+          .map((item) => ({
+            id: item.id.videoId,
+            title: item.snippet.title,
+            thumbnail:
+              item.snippet.thumbnails?.high?.url ||
+              item.snippet.thumbnails?.medium?.url ||
+              item.snippet.thumbnails?.default?.url,
+            publishedAt: item.snippet.publishedAt,
+          }));
+      }
+    } catch (ytErr) {
+      console.warn("Aviso YouTube API (cota ou erro de rede):", ytErr.message);
+      // Retorna array vazio em caso de erro, garantindo que o resto do payload seja entregue
+    }
 
-    // Vídeos YouTube
-    const ytRes = await axios.get(
-      `https://www.googleapis.com/youtube/v3/search?part=snippet&maxResults=20&q=${encodeURIComponent(query + " game trailer")}&key=${process.env.YT_API_KEY}`,
-    );
-    const videos = ytRes.data.items
-      .filter((item) => item.id.kind === "youtube#video")
-      .map((item) => ({ id: item.id.videoId, title: item.snippet.title }));
-
+    // 6. Resposta consolidada
     res.json({
       game: {
+        id: game.id,
         title: game.name,
         rating: ratingDisplay,
-        background_image: game.background_image,
-        platforms: game.platforms?.map((p) => p.platform.name) || [],
-        genres: game.genres?.map((g) => g.name) || [],
-        developers: game.developers?.map((d) => d.name) || [],
-        publishers: game.publishers?.map((p) => p.name) || [],
-        released: game.released,
-        description_raw:
-        game.description_raw?.substring(0, 500) + "..." || "Sem descrição",
+        rawRating: game.rating,
+        ratingsCount: game.ratings_count || 0,
+        metacritic: game.metacritic || null,
+        backgroundImage: game.background_image,
+        platforms: (game.platforms || []).map((p) => p.platform?.name).filter(Boolean),
+        genres: (game.genres || []).map((g) => g.name).filter(Boolean),
+        developers: (game.developers || []).map((d) => d.name).filter(Boolean),
+        publishers: (game.publishers || []).map((p) => p.name).filter(Boolean),
+        released: game.released || "Não informada",
+        website: game.website || null,
+        description:
+          game.description_raw?.trim() ||
+          game.description?.replace(/<[^>]*>/g, "")?.trim() ||
+          "Sem descrição disponível.",
       },
       aiVerdict,
-      MetaText,
+      metaText,
       videos,
     });
   } catch (error) {
-    console.error("Erro geral:", error.message);
-    res.status(500).json({ error: "Erro ao buscar informações do jogo" });
+    console.error("Erro geral na rota /api/game:", error.message);
+    const statusCode = error.response?.status || 500;
+    res.status(statusCode).json({
+      error: "Erro ao buscar informações do jogo.",
+      details: process.env.NODE_ENV === "development" ? error.message : undefined,
+    });
   }
 });
 
-/* app.listen(3000, () => {
-  console.log("Servidor rodando na porta 3000 localmente");
-}); */
+// Inicialização do servidor em ambientes não-serverless
+const PORT = process.env.PORT || 3000;
+if (!process.env.VERCEL) {
+  app.listen(PORT, () => {
+    console.log(`🎮 Review Games Backend rodando na porta ${PORT}`);
+  });
+}
 
-// No final do server.js
-module.exports = app;  // ou export default app; se usar ESM
+module.exports = app;
